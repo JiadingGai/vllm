@@ -1855,6 +1855,63 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         return [output]
 
+    def dualkv_decode_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        num_seqs: int,
+    ) -> Optional[torch.Tensor]:
+        """Lightweight decode step for DualKV bypass loop.
+
+        Runs model forward + lm_head projection without any scheduler
+        metadata, paged KV cache, or sampling infrastructure.
+        Returns logits tensor on driver worker, None on other workers.
+
+        Args:
+            input_ids: (num_seqs,) token IDs
+            positions: (num_seqs,) position indices
+            num_seqs: batch size (must match input tensors)
+        """
+        from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+
+        device = input_ids.device
+        attn_metadata = FlashAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decode_tokens=num_seqs,
+            slot_mapping=torch.zeros(num_seqs, dtype=torch.long, device=device),
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=True,
+            seq_lens=None,
+            seq_lens_tensor=torch.ones(
+                num_seqs, dtype=torch.int32, device=device),
+            max_prefill_seq_len=0,
+            max_decode_seq_len=1,
+            max_decode_query_len=1,
+            max_query_len=1,
+            context_lens_tensor=None,
+            block_tables=torch.zeros(
+                num_seqs, 1, dtype=torch.int32, device=device),
+            use_cuda_graph=False,
+            query_start_loc=torch.arange(
+                num_seqs + 1, dtype=torch.int32, device=device),
+            seq_start_loc=torch.arange(
+                num_seqs + 1, dtype=torch.int32, device=device),
+        )
+
+        with set_forward_context(attn_metadata, self.vllm_config):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+            )
+
+        # Project to vocabulary logits
+        logits = torch.matmul(
+            hidden_states.to(self.model.lm_head.weight.dtype),
+            self.model.lm_head.weight.T,
+        )
+        return logits
+
     def need_recv_kv(self, model_input, kv_caches) -> bool:
         """Check if we need to receive kv-cache from the other worker.
         We need to receive KV when

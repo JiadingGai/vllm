@@ -511,6 +511,16 @@ class Worker(LocalOrDistributedWorkerBase):
                                                 self.model_config,
                                                 self.parallel_config)
 
+    def dualkv_decode_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        num_seqs: int,
+    ) -> Optional[torch.Tensor]:
+        """Lightweight DualKV decode step dispatched to this worker."""
+        return self.model_runner.dualkv_decode_step(
+            input_ids, positions, num_seqs)
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

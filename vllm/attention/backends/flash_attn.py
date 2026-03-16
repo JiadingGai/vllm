@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer with FlashAttention."""
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import accumulate
@@ -29,6 +30,14 @@ from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
+
+from vllm.attention.backends.flash_attn_dualkv import (
+    DUALKV_ENABLED,
+    get_dualkv_state,
+    capture_context_kv,
+    allocate_decoded_kv,
+    dualkv_decode,
+)
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
@@ -729,27 +738,32 @@ class FlashAttentionImpl(AttentionImpl):
             #     tensor. Thus, we skip cache updates during this time.
             if (attn_type != AttentionType.ENCODER) and (key is not None) and (
                     value is not None):
-                if attn_type == AttentionType.ENCODER_DECODER:
-                    # Update cross-attention KV cache (prefill-only)
-                    updated_slot_mapping = attn_metadata.cross_slot_mapping
-                else:
-                    # Update self-attention KV cache (prefill/decode)
-                    updated_slot_mapping = attn_metadata.slot_mapping
+                # DualKV: skip paged cache write during decode — our kernel
+                # appends new K/V directly into the decoded buffer.
+                _is_dualkv_decode = (DUALKV_ENABLED
+                                     and attn_metadata.num_prefills == 0)
+                if not _is_dualkv_decode:
+                    if attn_type == AttentionType.ENCODER_DECODER:
+                        # Update cross-attention KV cache (prefill-only)
+                        updated_slot_mapping = attn_metadata.cross_slot_mapping
+                    else:
+                        # Update self-attention KV cache (prefill/decode)
+                        updated_slot_mapping = attn_metadata.slot_mapping
 
-                # Reshape the input keys and values and store them in the cache.
-                # If kv_cache is not provided, the new key and value tensors are
-                # not cached. This happens during the initial memory
-                # profiling run.
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    value,
-                    kv_cache[0],
-                    kv_cache[1],
-                    updated_slot_mapping.flatten(),  # type: ignore[union-attr]
-                    kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
+                    # Reshape the input keys and values and store them in
+                    # the cache. If kv_cache is not provided, the new key
+                    # and value tensors are not cached. This happens during
+                    # the initial memory profiling run.
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        kv_cache[0],
+                        kv_cache[1],
+                        updated_slot_mapping.flatten(),  # type: ignore[union-attr]
+                        kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
 
                 if fp8_attention:
                     kv_cache = kv_cache.view(torch.float8_e4m3fn)
@@ -769,6 +783,12 @@ class FlashAttentionImpl(AttentionImpl):
             get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
         decode_query = query[num_prefill_query_tokens:]
         decode_output = output[num_prefill_query_tokens:]
+        # Extract key/value for dualkv path
+        if DUALKV_ENABLED:
+            decode_key = key[num_prefill_kv_tokens:]
+            decode_value = value[num_prefill_kv_tokens:]
+            prefill_key_for_dualkv = key[:num_prefill_kv_tokens]
+            prefill_value_for_dualkv = value[:num_prefill_kv_tokens]
         # QKV for prefill.
         query = query[:num_prefill_query_tokens]
         prefill_output = output[:num_prefill_query_tokens]
@@ -854,6 +874,20 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
 
+        # DualKV: capture context KV directly from prefill key/value
+        # (bypass paged KV cache entirely).
+        if DUALKV_ENABLED and num_prefill_kv_tokens > 0:
+            assert prefill_meta is not None
+            first_seq_len = prefill_meta.seq_lens[0]
+            state = get_dualkv_state(id(layer))
+            # Reset initialized flag so decode path reallocates buffers
+            # with correct batch size (warmup may have set it with dummy data).
+            state.reset()
+            state.context_k, state.context_v = capture_context_kv(
+                prefill_key_for_dualkv, prefill_value_for_dualkv,
+                first_seq_len)
+            state.context_seqlen = first_seq_len
+
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             # Use flash_attn_varlen_func kernel for speculative decoding
@@ -895,24 +929,60 @@ class FlashAttentionImpl(AttentionImpl):
                     _,
                     block_tables_arg,
                 ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
-                descale_shape = (seq_lens_arg.shape[0], key_cache.shape[-2])
-                flash_attn_with_kvcache(
-                    q=decode_query.unsqueeze(1),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    block_table=block_tables_arg,
-                    cache_seqlens=seq_lens_arg,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    window_size=window_size,
-                    alibi_slopes=alibi_slopes,
-                    softcap=logits_soft_cap,
-                    out=decode_output.unsqueeze(1),
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                )
+
+                if DUALKV_ENABLED:
+                    # DualKV decode path: use contiguous context + decoded
+                    # KV caches instead of paged KV cache.
+                    state = get_dualkv_state(id(layer))
+                    bs = decode_query.shape[0]
+
+                    if not state.initialized:
+                        # First decode step: allocate decoded buffers.
+                        # Context was already captured during prefill.
+                        assert state.context_k is not None, (
+                            "DualKV context not captured during prefill. "
+                            "Ensure VLLM_USE_DUALKV=1 is set before import."
+                        )
+                        max_decode_len = int(os.environ.get(
+                            "VLLM_DUALKV_MAX_DECODE_LEN", "1024"))
+                        nheads_k = state.context_k.shape[2]
+                        hdim = state.context_k.shape[3]
+                        state.decoded_k, state.decoded_v = \
+                            allocate_decoded_kv(
+                                bs, max_decode_len, nheads_k, hdim,
+                                decode_query.device, decode_query.dtype)
+                        state.decoded_seqlens = torch.zeros(
+                            bs, dtype=torch.int32,
+                            device=decode_query.device)
+                        state.initialized = True
+
+                    decode_output[:] = dualkv_decode(
+                        decode_query, decode_key, decode_value,
+                        state, softmax_scale,
+                        alibi_slopes=alibi_slopes,
+                        softcap=logits_soft_cap,
+                        window_size=window_size,
+                    )
+                else:
+                    descale_shape = (seq_lens_arg.shape[0],
+                                     key_cache.shape[-2])
+                    flash_attn_with_kvcache(
+                        q=decode_query.unsqueeze(1),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_table=block_tables_arg,
+                        cache_seqlens=seq_lens_arg,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        window_size=window_size,
+                        alibi_slopes=alibi_slopes,
+                        softcap=logits_soft_cap,
+                        out=decode_output.unsqueeze(1),
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                    )
         return output
 
 
